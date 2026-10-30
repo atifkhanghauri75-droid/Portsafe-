@@ -8,6 +8,7 @@ import 'dart:ui' as ui;
 
 import 'package:excel/excel.dart' hide Border;
 import 'package:flutter/material.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -391,7 +392,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 MaterialPageRoute(builder: (_) => const TbtScreen()));
           }),
           _card(context, Icons.checklist, 'Attendance',
-              'Daily attendance with signatures and overtime hours',
+              'Tick present workers, overtime hours, OT summary',
               () async {
             await Navigator.push(
                 context,
@@ -410,7 +411,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 MaterialPageRoute(builder: (_) => const DamageScreen()));
           }),
           _card(context, Icons.people, 'Staff List',
-              'Operators, labour and foremen + photo-assisted import',
+              'Operators, labour and foremen + photo import (auto-read)',
               () async {
             await Navigator.push(context,
                 MaterialPageRoute(builder: (_) => const StaffScreen()));
@@ -738,7 +739,7 @@ class _StaffScreenState extends State<StaffScreen> {
               child: Padding(
                 padding: EdgeInsets.all(24),
                 child: Text(
-                  'No staff yet. Tap + to add manually, or use the camera button for photo-assisted import.',
+                  'No staff yet. Tap + to add manually, or use the camera button for photo import (the list is read automatically).',
                   textAlign: TextAlign.center,
                 ),
               ),
@@ -774,7 +775,254 @@ class _StaffScreenState extends State<StaffScreen> {
   }
 }
 
-// ---------------- Photo-assisted import (review before save) ----------------
+// ---------------- Photo import with on-device text recognition ----------------
+// The photo is read on this phone only (ML Kit text recognition, offline).
+// Nothing is uploaded. Parsing is best-effort: every row must be reviewed
+// and can be edited before saving.
+
+const List<String> _kDesignationWords = [
+  'OPERATOR',
+  'LABOUR',
+  'LABOR',
+  'FOREMAN',
+  'SUPERVISOR',
+  'DRIVER',
+  'RIGGER',
+  'SIGNALMAN',
+  'HELPER',
+  'WELDER',
+  'WELDING',
+  'FITTER',
+  'MECHANIC',
+  'ELECTRICIAN',
+  'CARPENTER',
+  'MASON',
+  'PLUMBER',
+  'PAINTER',
+  'CLEANER',
+  'WATCHMAN',
+  'SECURITY',
+  'TECHNICIAN',
+  'STOREKEEPER',
+];
+
+const Map<String, String> _kDesignationCanon = {
+  'LABOUR': 'Labour',
+  'LABOR': 'Labour',
+  'OPERATOR': 'Operator',
+  'FOREMAN': 'Foreman',
+  'SUPERVISOR': 'Supervisor',
+  'WELDING': 'Welder',
+};
+
+const List<String> _kNationalityWords = [
+  'PAKISTANI',
+  'INDIAN',
+  'BANGLADESHI',
+  'FILIPINO',
+  'EGYPTIAN',
+  'SUDANESE',
+  'YEMENI',
+  'NEPALI',
+  'INDONESIAN',
+  'ETHIOPIAN',
+  'AFGHAN',
+  'SYRIAN',
+  'JORDANIAN',
+  'PALESTINIAN',
+  'TURKISH',
+  'KENYAN',
+  'SOMALI',
+  'ERITREAN',
+];
+
+const Map<String, String> _kCountryToNationality = {
+  'PAKISTAN': 'Pakistani',
+  'INDIA': 'Indian',
+  'BANGLADESH': 'Bangladeshi',
+  'PHILIPPINES': 'Filipino',
+  'EGYPT': 'Egyptian',
+  'SUDAN': 'Sudanese',
+  'YEMEN': 'Yemeni',
+  'NEPAL': 'Nepali',
+  'AFGHANISTAN': 'Afghan',
+};
+
+String _titleCaseWords(String s) {
+  return s
+      .split(RegExp(r'\s+'))
+      .where((w) => w.isNotEmpty)
+      .map((w) => w.length == 1
+          ? w.toUpperCase()
+          : '${w.substring(0, 1).toUpperCase()}${w.substring(1).toLowerCase()}')
+      .join(' ');
+}
+
+/// Best-effort parse of recognised text lines into staff rows.
+/// Every returned map has name / iqama / designation / nationality / shift.
+List<Map<String, String>> parseStaffLines(List<String> rawLines) {
+  final rows = <Map<String, String>>[];
+  var ctxDesignation = '';
+  var ctxShift = '';
+
+  Map<String, String> blank() => {
+        'name': '',
+        'iqama': '',
+        'designation': '',
+        'nationality': '',
+        'shift': '',
+      };
+
+  for (final raw in rawLines) {
+    var line = raw.trim();
+    if (line.isEmpty) continue;
+    // Join digits split by spaces ("2481 234 567" -> "2481234567").
+    for (var i = 0; i < 3; i++) {
+      line = line.replaceAllMapped(RegExp(r'(\d)\s+(?=\d)'), (m) => m.group(1)!);
+    }
+    final upper = line.toUpperCase();
+
+    // Skip table header lines (column titles, no data).
+    const headerWords = [
+      'IQAMA',
+      'DESIGNATION',
+      'NATIONALITY',
+      'SHIFT',
+      'S.NO',
+      'SERIAL'
+    ];
+    final headerCount = headerWords.where((h) => upper.contains(h)).length;
+    if (headerCount >= 2 && !RegExp(r'\d{8,}').hasMatch(line)) continue;
+
+    final part = blank();
+
+    // Iqama: longest run of 8+ digits.
+    final iqamaMatch = RegExp(r'\d{8,}').firstMatch(line);
+    if (iqamaMatch != null) {
+      part['iqama'] = iqamaMatch.group(0)!;
+      line = line.replaceRange(iqamaMatch.start, iqamaMatch.end, ' ');
+    }
+
+    var rest = line.toUpperCase();
+
+    // Designation keyword.
+    for (final w in _kDesignationWords) {
+      if (RegExp('\\b$w\\b').hasMatch(rest)) {
+        part['designation'] = _kDesignationCanon[w] ?? _titleCaseWords(w);
+        rest = rest.replaceAll(RegExp('\\b$w\\b'), ' ');
+        break;
+      }
+    }
+    // Shift keyword (the app stores Day / Night; T1/T2/A/B tokens are
+    // dropped from the name but not guessed into a shift).
+    if (RegExp(r'\bNIGHT\b').hasMatch(rest)) {
+      part['shift'] = 'Night';
+      rest = rest.replaceAll(RegExp(r'\bNIGHT\b'), ' ');
+    } else if (RegExp(r'\bDAY\b').hasMatch(rest)) {
+      part['shift'] = 'Day';
+      rest = rest.replaceAll(RegExp(r'\bDAY\b'), ' ');
+    }
+    rest = rest.replaceAll(RegExp(r'\b(T1|T2|A|B)\b'), ' ');
+    // Nationality (demonym first, then country name).
+    for (final w in _kNationalityWords) {
+      if (RegExp('\\b$w\\b').hasMatch(rest)) {
+        part['nationality'] = _titleCaseWords(w);
+        rest = rest.replaceAll(RegExp('\\b$w\\b'), ' ');
+        break;
+      }
+    }
+    if (part['nationality']!.isEmpty) {
+      for (final e in _kCountryToNationality.entries) {
+        if (RegExp('\\b${e.key}\\b').hasMatch(rest)) {
+          part['nationality'] = e.value;
+          rest = rest.replaceAll(RegExp('\\b${e.key}\\b'), ' ');
+          break;
+        }
+      }
+    }
+
+    // Whatever words remain are the name, minus junk tokens.
+    const junk = {
+      'MR',
+      'NO',
+      'ID',
+      'IQAMA',
+      'NAME',
+      'DESIGNATION',
+      'NATIONALITY',
+      'SHIFT',
+      'STAFF',
+      'LIST',
+      'TOTAL'
+    };
+    final nameTokens = rest
+        .split(RegExp(r'[^A-Za-z]+'))
+        .where((t) => t.length >= 2 && !junk.contains(t))
+        .toList();
+    part['name'] = _titleCaseWords(nameTokens.join(' '));
+
+    if (part['name']!.isEmpty && part['iqama']!.isEmpty) {
+      // A fragment line (e.g. one column cell on its own line): fill the
+      // previous row's blanks and remember the values as context.
+      if (part['designation']!.isNotEmpty) {
+        ctxDesignation = part['designation']!;
+      }
+      if (part['shift']!.isNotEmpty) ctxShift = part['shift']!;
+      if (rows.isNotEmpty) {
+        final last = rows.last;
+        if (last['designation']!.isEmpty) {
+          last['designation'] = part['designation']!;
+        }
+        if (last['shift']!.isEmpty) last['shift'] = part['shift']!;
+        if (last['nationality']!.isEmpty) {
+          last['nationality'] = part['nationality']!;
+        }
+      }
+      continue;
+    }
+
+    if (part['name']!.isEmpty &&
+        rows.isNotEmpty &&
+        rows.last['iqama']!.isEmpty) {
+      // Iqama printed on the line below the name: merge into previous row.
+      // Values read on this line are explicit, so they win over any
+      // context guesses already filled into the previous row.
+      final last = rows.last;
+      last['iqama'] = part['iqama']!;
+      if (part['designation']!.isNotEmpty) {
+        last['designation'] = part['designation']!;
+      }
+      if (part['shift']!.isNotEmpty) last['shift'] = part['shift']!;
+      if (part['nationality']!.isNotEmpty) {
+        last['nationality'] = part['nationality']!;
+      }
+      continue;
+    }
+
+    if (part['designation']!.isEmpty) part['designation'] = ctxDesignation;
+    if (part['shift']!.isEmpty) part['shift'] = ctxShift;
+    if (part['designation']!.isNotEmpty) {
+      ctxDesignation = part['designation']!;
+    }
+    if (part['shift']!.isNotEmpty) ctxShift = part['shift']!;
+    rows.add(part);
+  }
+
+  for (final r in rows) {
+    if (r['designation']!.isEmpty) r['designation'] = 'Labour';
+    if (r['shift']!.isEmpty) r['shift'] = 'Day';
+  }
+  return rows;
+}
+
+bool _dupIn(Map<String, String> r, List<Map<String, Object?>> list) {
+  final name = (r['name'] ?? '').trim().toLowerCase();
+  return list.any((e) =>
+      ((r['iqama'] ?? '').isNotEmpty && e['iqama'] == r['iqama']) ||
+      (name.isNotEmpty &&
+          ((e['name'] as String?) ?? '').trim().toLowerCase() == name));
+}
+
 class PhotoImportScreen extends StatefulWidget {
   const PhotoImportScreen({super.key});
   @override
@@ -783,18 +1031,92 @@ class PhotoImportScreen extends StatefulWidget {
 
 class _PhotoImportScreenState extends State<PhotoImportScreen> {
   String? _photoPath;
+  bool _reading = false;
   final List<Map<String, String>> _rows = [];
+  List<Map<String, Object?>> _existing = [];
 
-  Future<void> _addRow() async {
-    final name = TextEditingController();
-    final iqama = TextEditingController();
-    final nat = TextEditingController();
-    String des = 'Labour';
-    String shift = 'Day';
+  @override
+  void initState() {
+    super.initState();
+    _loadExisting();
+  }
+
+  Future<void> _loadExisting() async {
+    final list = await DbHelper.instance.staffList();
+    if (mounted) setState(() => _existing = list);
+  }
+
+  Future<void> _pickAndRead(ImageSource source) async {
+    final picked = await ImagePicker().pickImage(source: source);
+    if (picked == null) return;
+    final bytes = await picked.readAsBytes();
+    final name =
+        'img_${DateTime.now().millisecondsSinceEpoch}${p.extension(picked.path)}';
+    final path = await saveBytesToDocs(bytes, name);
+    if (!mounted) return;
+    setState(() => _photoPath = path);
+    await _readText(path);
+  }
+
+  Future<void> _readText(String path) async {
+    setState(() => _reading = true);
+    final recognizer = TextRecognizer(script: TextRecognitionScript.latin);
+    try {
+      final result =
+          await recognizer.processImage(InputImage.fromFilePath(path));
+      final lines = <String>[];
+      for (final block in result.blocks) {
+        for (final line in block.lines) {
+          lines.add(line.text);
+        }
+      }
+      final parsed =
+          parseStaffLines(lines.isNotEmpty ? lines : result.text.split('\n'));
+      if (!mounted) return;
+      if (parsed.isEmpty) {
+        showMsg(context,
+            'No staff rows could be read from this photo. Add rows manually below.');
+      } else {
+        var added = 0;
+        setState(() {
+          for (final r in parsed) {
+            final alreadyListed = _rows.any((x) =>
+                ((r['iqama'] ?? '').isNotEmpty && x['iqama'] == r['iqama']) ||
+                ((r['name'] ?? '').isNotEmpty &&
+                    (x['name'] ?? '').toLowerCase() ==
+                        r['name']!.toLowerCase()));
+            if (!alreadyListed) {
+              _rows.add(r);
+              added++;
+            }
+          }
+        });
+        showMsg(context,
+            'Read $added row(s) from the photo. Please review and fix any mistakes before saving.');
+      }
+    } catch (_) {
+      if (mounted) {
+        showMsg(context,
+            'Text reading failed for this photo. Add rows manually below.');
+      }
+    } finally {
+      await recognizer.close();
+      if (mounted) setState(() => _reading = false);
+    }
+  }
+
+  Future<void> _rowDialog([int? index]) async {
+    final row = index == null ? null : _rows[index];
+    final name = TextEditingController(text: row?['name'] ?? '');
+    final iqama = TextEditingController(text: row?['iqama'] ?? '');
+    final nat = TextEditingController(text: row?['nationality'] ?? '');
+    String des = row?['designation'] ?? 'Labour';
+    String shift = row?['shift'] ?? 'Day';
+    final desItems = <String>{'Operator', 'Labour', 'Foreman', des}.toList();
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Add row from photo'),
+        title: Text(index == null ? 'Add row' : 'Edit row'),
         content: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -811,7 +1133,7 @@ class _PhotoImportScreenState extends State<PhotoImportScreen> {
                       const InputDecoration(labelText: 'Nationality')),
               DropdownButtonFormField<String>(
                 value: des,
-                items: const ['Operator', 'Labour', 'Foreman']
+                items: desItems
                     .map((e) => DropdownMenuItem(value: e, child: Text(e)))
                     .toList(),
                 onChanged: (v) => des = v ?? des,
@@ -834,31 +1156,36 @@ class _PhotoImportScreenState extends State<PhotoImportScreen> {
               child: const Text('Cancel')),
           ElevatedButton(
               onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('Add to review')),
+              child: Text(index == null ? 'Add to review' : 'Update row')),
         ],
       ),
     );
-    if (ok == true && name.text.trim().isNotEmpty) {
-      setState(() {
-        _rows.add({
-          'name': name.text.trim(),
-          'iqama': iqama.text.trim(),
-          'nationality': nat.text.trim(),
-          'designation': des,
-          'shift': shift,
-        });
-      });
-    }
+    if (ok != true || name.text.trim().isEmpty) return;
+    setState(() {
+      final data = {
+        'name': name.text.trim(),
+        'iqama': iqama.text.trim(),
+        'nationality': nat.text.trim(),
+        'designation': des,
+        'shift': shift,
+      };
+      if (index == null) {
+        _rows.add(data);
+      } else {
+        _rows[index] = data;
+      }
+    });
   }
 
   Future<void> _saveAll() async {
-    final existing = await DbHelper.instance.staffList();
+    final existing = [..._existing];
     var added = 0;
+    var skipped = 0;
     for (final r in _rows) {
-      final dup = existing.any((e) =>
-          (r['iqama']!.isNotEmpty && e['iqama'] == r['iqama']) ||
-          (e['name'] == r['name']));
-      if (dup) continue;
+      if ((r['name'] ?? '').trim().isEmpty || _dupIn(r, existing)) {
+        skipped++;
+        continue;
+      }
       await DbHelper.instance.insertStaff({
         'name': r['name']!,
         'iqama': r['iqama']!,
@@ -866,9 +1193,16 @@ class _PhotoImportScreenState extends State<PhotoImportScreen> {
         'designation': r['designation']!,
         'shift': r['shift']!,
       });
+      existing.add(Map<String, Object?>.from(r));
       added++;
     }
-    if (mounted) showMsg(context, 'Saved $added staff (duplicates skipped)');
+    if (mounted) {
+      showMsg(
+          context,
+          skipped > 0
+              ? 'Saved $added staff ($skipped skipped: duplicate or missing name)'
+              : 'Saved $added staff');
+    }
     if (mounted) Navigator.pop(context);
   }
 
@@ -880,17 +1214,44 @@ class _PhotoImportScreenState extends State<PhotoImportScreen> {
         padding: const EdgeInsets.all(16),
         children: [
           const Text(
-            'Pick a photo of a staff list, read each row from the photo, add it below and review before saving. Automatic text recognition is not included in this test build.',
+            'Take or pick a photo of a staff list. The text is read automatically on this phone (offline) — nothing is uploaded. Check every row below, tap a row to fix mistakes, then save.',
             style: TextStyle(fontSize: 13),
           ),
           const SizedBox(height: 12),
-          ElevatedButton(
-            onPressed: () async {
-              final path = await pickImagePath();
-              if (path != null) setState(() => _photoPath = path);
-            },
-            child: const Text('Pick staff list photo'),
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed:
+                      _reading ? null : () => _pickAndRead(ImageSource.camera),
+                  icon: const Icon(Icons.photo_camera),
+                  label: const Text('Take photo'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed:
+                      _reading ? null : () => _pickAndRead(ImageSource.gallery),
+                  icon: const Icon(Icons.photo_library),
+                  label: const Text('Pick from gallery'),
+                ),
+              ),
+            ],
           ),
+          if (_reading) ...[
+            const SizedBox(height: 16),
+            const Row(
+              children: [
+                SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2)),
+                SizedBox(width: 10),
+                Text('Reading text from photo…'),
+              ],
+            ),
+          ],
           if (_photoPath != null) ...[
             const SizedBox(height: 12),
             Image.file(File(_photoPath!), height: 220, fit: BoxFit.contain),
@@ -899,7 +1260,8 @@ class _PhotoImportScreenState extends State<PhotoImportScreen> {
           Row(
             children: [
               ElevatedButton(
-                  onPressed: _addRow, child: const Text('Add row')),
+                  onPressed: () => _rowDialog(),
+                  child: const Text('Add row')),
               const SizedBox(width: 8),
               ElevatedButton(
                   onPressed: _rows.isEmpty ? null : _saveAll,
@@ -909,13 +1271,16 @@ class _PhotoImportScreenState extends State<PhotoImportScreen> {
           const SizedBox(height: 12),
           for (var i = 0; i < _rows.length; i++)
             ListTile(
-              title: Text(_rows[i]['name']!),
+              title: Text((_rows[i]['name'] ?? '').isEmpty
+                  ? '(Name missing — tap to edit)'
+                  : _rows[i]['name']!),
               subtitle: Text(
-                  '${_rows[i]['designation']} • ${_rows[i]['shift']} • Iqama: ${_rows[i]['iqama']} • ${_rows[i]['nationality']}'),
+                  '${_rows[i]['designation']} • ${_rows[i]['shift']} • Iqama: ${_rows[i]['iqama']} • ${_rows[i]['nationality']}${_dupIn(_rows[i], _existing) ? '\nAlready in staff list — will be skipped' : ''}'),
               trailing: IconButton(
                 icon: const Icon(Icons.close),
                 onPressed: () => setState(() => _rows.removeAt(i)),
               ),
+              onTap: () => _rowDialog(i),
             ),
         ],
       ),
@@ -1372,10 +1737,11 @@ class AttendanceScreen extends StatefulWidget {
 
 class _AttendanceScreenState extends State<AttendanceScreen> {
   DateTime _date = DateTime.now();
+  String _shift = 'Day';
   List<Map<String, Object?>> _staff = [];
-  final Map<int, String> _shifts = {};
+  final Set<int> _present = {};
+  final Map<int, TextEditingController> _otCtrls = {};
   final Map<int, String> _remarks = {};
-  final Map<int, String> _ot = {};
   final Map<int, Uint8List?> _sigs = {};
   bool _showSummary = false;
 
@@ -1385,54 +1751,93 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
     _load();
   }
 
+  @override
+  void dispose() {
+    for (final c in _otCtrls.values) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  static String _otText(double ot) =>
+      ot == 0 ? '' : ot.toString().replaceAll(RegExp(r'\.0$'), '');
+
+  TextEditingController _otCtrl(int sid) =>
+      _otCtrls.putIfAbsent(sid, () => TextEditingController());
+
   Future<void> _load() async {
     final staff = await DbHelper.instance.staffList();
     final d = await DbHelper.instance.db;
     final rows = await d.query('attendance',
-        where: 'date = ?', whereArgs: [fmtDate(_date)]);
-    if (mounted) {
-      setState(() {
-        _staff = staff;
-        _shifts.clear();
-        _remarks.clear();
-        _ot.clear();
-        _sigs.clear();
-        for (final r in rows) {
-          final sid = r['staff_id'] as int;
-          _shifts[sid] = (r['shift'] as String?) ?? 'Day';
-          _remarks[sid] = (r['remarks'] as String?) ?? '';
-          _ot[sid] = (r['ot_hours'] as num?)?.toString() ?? '';
-          _sigs[sid] = r['signature'] as Uint8List?;
-        }
-      });
+        where: 'date = ? AND shift = ?',
+        whereArgs: [fmtDate(_date), _shift]);
+    if (!mounted) return;
+    for (final c in _otCtrls.values) {
+      c.dispose();
     }
+    _otCtrls.clear();
+    setState(() {
+      _staff = staff;
+      _present.clear();
+      _remarks.clear();
+      _sigs.clear();
+      for (final r in rows) {
+        final sid = r['staff_id'] as int;
+        _present.add(sid);
+        _remarks[sid] = (r['remarks'] as String?) ?? '';
+        _sigs[sid] = r['signature'] as Uint8List?;
+        _otCtrls[sid] = TextEditingController(
+            text: _otText(((r['ot_hours'] as num?) ?? 0).toDouble()));
+      }
+    });
   }
+
+  /// Staff of the selected shift, plus anyone already marked present for
+  /// this date + shift (so editing a saved day shows every saved tick,
+  /// even if a worker's own shift differs).
+  List<Map<String, Object?>> get _visibleStaff => _staff.where((s) {
+        final sid = s['id'] as int;
+        final ownShift = (s['shift'] as String?) ?? 'Day';
+        return ownShift == _shift || _present.contains(sid);
+      }).toList();
 
   Future<void> _save() async {
     final d = await DbHelper.instance.db;
+    final dateStr = fmtDate(_date);
     await d.delete('attendance',
-        where: 'date = ?', whereArgs: [fmtDate(_date)]);
+        where: 'date = ? AND shift = ?', whereArgs: [dateStr, _shift]);
+    var count = 0;
     for (final s in _staff) {
       final sid = s['id'] as int;
+      if (!_present.contains(sid)) continue;
       await d.insert('attendance', {
-        'date': fmtDate(_date),
+        'date': dateStr,
         'staff_id': sid,
         'staff_name': s['name'],
         'designation': s['designation'],
-        'shift': _shifts[sid] ?? (s['shift'] as String?) ?? 'Day',
+        'shift': _shift,
         'remarks': _remarks[sid] ?? '',
-        'ot_hours': double.tryParse(_ot[sid] ?? '') ?? 0,
+        'ot_hours': double.tryParse(_otCtrl(sid).text.trim()) ?? 0,
         'signature': _sigs[sid],
       });
+      count++;
     }
-    if (mounted) showMsg(context, 'Attendance saved for ${fmtDate(_date)}');
+    if (mounted) {
+      showMsg(context,
+          'Attendance saved: $count present on $dateStr ($_shift shift)');
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_showSummary) return _OtSummary(onBack: () {
-      setState(() => _showSummary = false);
-    });
+    if (_showSummary) {
+      return _OtSummary(onBack: () {
+        setState(() => _showSummary = false);
+      });
+    }
+    final visible = _visibleStaff;
+    final tickedCount =
+        visible.where((s) => _present.contains(s['id'] as int)).length;
     return Scaffold(
       appBar: AppBar(
         title: const Text('Attendance'),
@@ -1461,96 +1866,122 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
               }
             },
           ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Row(
+              children: [
+                Expanded(
+                  child: DropdownButtonFormField<String>(
+                    value: _shift,
+                    items: const ['Day', 'Night']
+                        .map((e) => DropdownMenuItem(value: e, child: Text(e)))
+                        .toList(),
+                    onChanged: (v) {
+                      setState(() => _shift = v ?? 'Day');
+                      _load();
+                    },
+                    decoration: const InputDecoration(labelText: 'Shift'),
+                  ),
+                ),
+                const SizedBox(width: 16),
+                Text('Present: $tickedCount of ${visible.length}',
+                    style: const TextStyle(fontWeight: FontWeight.bold)),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+            child: Row(
+              children: [
+                TextButton(
+                  onPressed: visible.isEmpty
+                      ? null
+                      : () => setState(() {
+                            for (final s in visible) {
+                              _present.add(s['id'] as int);
+                            }
+                          }),
+                  child: const Text('Select all'),
+                ),
+                TextButton(
+                  onPressed: _present.isEmpty
+                      ? null
+                      : () => setState(() => _present.clear()),
+                  child: const Text('Clear'),
+                ),
+                const Expanded(
+                  child: Text('Tick the workers who are present, then Save.',
+                      style: TextStyle(fontSize: 12, color: Colors.grey)),
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
           Expanded(
             child: _staff.isEmpty
-                ? const Center(
-                    child: Text('No staff yet. Add staff first.'))
-                : ListView.builder(
-                    itemCount: _staff.length,
-                    itemBuilder: (ctx, i) {
-                      final s = _staff[i];
-                      final sid = s['id'] as int;
-                      return Card(
-                        margin: const EdgeInsets.symmetric(
-                            horizontal: 12, vertical: 4),
-                        child: Padding(
-                          padding: const EdgeInsets.all(8),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text((s['name'] as String?) ?? '',
-                                  style: const TextStyle(
-                                      fontWeight: FontWeight.bold)),
-                              Text(
-                                  '${s['designation']} • ${(s['shift'] as String?) ?? ''} shift'),
-                              Row(
+                ? const Center(child: Text('No staff yet. Add staff first.'))
+                : visible.isEmpty
+                    ? Center(child: Text('No staff in the $_shift shift.'))
+                    : ListView.builder(
+                        itemCount: visible.length,
+                        itemBuilder: (ctx, i) {
+                          final s = visible[i];
+                          final sid = s['id'] as int;
+                          final ticked = _present.contains(sid);
+                          return Card(
+                            margin: const EdgeInsets.symmetric(
+                                horizontal: 12, vertical: 4),
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 4, vertical: 6),
+                              child: Row(
                                 children: [
-                                  Expanded(
-                                    child: DropdownButtonFormField<String>(
-                                      value: _shifts[sid] ??
-                                          (s['shift'] as String?) ??
-                                          'Day',
-                                      items: const ['Day', 'Night']
-                                          .map((e) => DropdownMenuItem(
-                                              value: e, child: Text(e)))
-                                          .toList(),
-                                      onChanged: (v) => setState(
-                                          () => _shifts[sid] = v ?? 'Day'),
-                                      decoration: const InputDecoration(
-                                          labelText: 'Shift'),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: TextFormField(
-                                      initialValue: _ot[sid] ?? '',
-                                      keyboardType:
-                                          const TextInputType.numberWithOptions(
-                                              decimal: true),
-                                      decoration: const InputDecoration(
-                                          labelText: 'OT hours (manual)'),
-                                      onChanged: (v) => _ot[sid] = v,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              Row(
-                                children: [
-                                  Expanded(
-                                    child: TextFormField(
-                                      initialValue: _remarks[sid] ?? '',
-                                      decoration: const InputDecoration(
-                                          labelText: 'Remarks'),
-                                      onChanged: (v) => _remarks[sid] = v,
-                                    ),
-                                  ),
-                                  TextButton(
-                                    onPressed: () async {
-                                      final sig =
-                                          await askSignature(context);
-                                      if (sig != null) {
-                                        setState(
-                                            () => _sigs[sid] = sig);
+                                  Checkbox(
+                                    value: ticked,
+                                    onChanged: (v) => setState(() {
+                                      if (v == true) {
+                                        _present.add(sid);
+                                      } else {
+                                        _present.remove(sid);
                                       }
-                                    },
-                                    child: Text(_sigs[sid] != null
-                                        ? 'Signed ✓'
-                                        : 'Sign'),
+                                    }),
                                   ),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        Text((s['name'] as String?) ?? '',
+                                            style: const TextStyle(
+                                                fontWeight: FontWeight.bold)),
+                                        Text(
+                                            '${s['designation']} • ${(s['shift'] as String?) ?? ''} shift'),
+                                      ],
+                                    ),
+                                  ),
+                                  if (ticked)
+                                    SizedBox(
+                                      width: 92,
+                                      child: TextField(
+                                        controller: _otCtrl(sid),
+                                        keyboardType: const TextInputType
+                                            .numberWithOptions(decimal: true),
+                                        decoration: const InputDecoration(
+                                            labelText: 'OT hours',
+                                            hintText: '0'),
+                                      ),
+                                    ),
                                 ],
                               ),
-                            ],
-                          ),
-                        ),
-                      );
-                    },
-                  ),
+                            ),
+                          );
+                        },
+                      ),
           ),
           Padding(
             padding: const EdgeInsets.all(12),
             child: ElevatedButton(
-                onPressed: _save,
-                child: const Text('Save attendance')),
+                onPressed: _save, child: const Text('Save attendance')),
           ),
         ],
       ),

@@ -19,7 +19,10 @@ android {
         applicationId = "com.portsafe.portsafe"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        // google_mlkit_text_recognition requires API 21+. 24 is this
+        // toolchain's Flutter default minimum, so the requirement is met
+        // with room to spare; set explicitly so it cannot drift below 21.
+        minSdk = 24
         targetSdk = flutter.targetSdkVersion
         // Uses the version code from pubspec.yaml. When using split APKs, 1000 * ABI_VERSION
         // is added automatically by Flutter. (https://developer.android.com/studio/build/configure-apk-splits#configure-APK-versions)
